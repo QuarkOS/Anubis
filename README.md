@@ -50,4 +50,4 @@ We use GitHub Issues for tracking requests and bugs. The Anubis project strives 
 
 ## License
 
-Apache License 2.0
+MIT License
