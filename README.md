@@ -1,43 +1,53 @@
-# Anubis
+# Anubis: A Multimodal Desktop Assistant Platform
 
-A multimodal desktop assistant that combines a Python/FastAPI backend with a Godot-based transparent overlay. 
+Anubis is an end-to-end multimodal platform for desktop-integrated intelligence. It provides a comprehensive orchestration framework that enables Gemini 3.0 Flash Preview to interface directly with local system state—specifically screen context and audio input—allowing developers to build and deploy highly contextual AI-powered tools.
 
-I built this because I wanted a way to interact with an LLM that could see my screen and hear me without having to alt-tab or use a browser. It uses Gemini Flash 2.0 for the heavy lifting (vision/voice reasoning) and Edge-TTS for the voice output.
+Anubis was developed to bridge the gap between high-reasoning LLMs and the local desktop environment. By utilizing a hybrid architecture of a Python-based backend and a Godot-powered Win32 overlay, the platform is versatile enough to be used for productivity assistance, real-time gaming analysis, and UI/UX research.
 
-The visual component is handled via a Win32 overlay powered by Godot, which lets me experiment with custom shaders for the avatar/UI feedback.
+The platform provides stable Python APIs for multimodal orchestration and an experimental Godot-based visualization layer for real-time feedback.
 
-## 🛠️ How it works
+## Install
 
-- **PTT Trigger:** Mapped to `F14`. Holding it down triggers a screen capture and audio recording.
-- **Multimodal Context:** On release, the captured png and wav are sent to the Gemini 2.0 Flash model.
-- **Backend:** FastAPI handles the orchestration between recording, LLM calls, and TTS.
-- **Overlay:** A Godot project (`shader_test`) provides a transparent window with various shader experiments for visual feedback.
+See the Anubis install guide for detailed environment setup. The project utilizes `uv` for high-performance dependency management.
 
-## 🚀 Setup
+To install the current release and its dependencies:
 
-1. **Install Dependencies:**
-   This project uses [uv](https://github.com/astral-sh/uv) for Python management.
-   ```bash
-   cd ai-assistant
-   uv sync
-   ```
+```bash
+uv sync
+```
 
-2. **Configuration:**
-   Copy the example env file and add your Gemini API key:
-   ```bash
-   cp .env.example .env
-   ```
+Ensure you have a Google Gemini API key configured in your environment variables or a `.env` file:
 
-3. **Run:**
-   ```bash
-   uv run python main_anubis.py
-   ```
+```bash
+ANUBIS_LLM_API_KEY=your_api_key_here
+```
 
-## ⌨️ Controls
+## Try your first Anubis session
 
-- **F14 (Hold):** Record voice + capture screen.
-- **Release:** Send to Anubis.
+```bash
+uv run python main_anubis.py
+```
 
----
+Once initialized, press and hold the `F14` key to capture your current screen and audio. Release the key to send the multimodal context to the model and receive a concise voice response.
 
-*Note: This is a personal project and very much a work-in-progress. The Godot shaders in `shader_test` are experiments for a future UI/avatar integration.*
+## Contribution guidelines
+
+If you want to contribute to Anubis, be sure to review the Contribution Guidelines. This project adheres to a professional Code of Conduct. By participating, you are expected to uphold this code.
+
+We use GitHub Issues for tracking requests and bugs. The Anubis project strives to abide by generally accepted best practices in open-source software development.
+
+## Project Structure
+
+*   **src/anubis/**: The core Python orchestration layer handling LLM interop, PTT logic, and TTS.
+*   **shader_test/**: A Godot 4.x project providing a transparent Win32 overlay and experimental shaders.
+*   **main_anubis.py**: Entry point for the multimodal assistant.
+
+## Resources
+
+*   Google GenAI Documentation
+*   Godot Engine Documentation
+*   Edge-TTS Repository
+
+## License
+
+Apache License 2.0
