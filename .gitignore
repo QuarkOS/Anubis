@@ -18,6 +18,11 @@ shader_test/export/
 anubis_audio_context.wav
 anubis_vision_context.png
 anubis_response.mp3
+anubis_response_seg_*.wav
+
+# Models
+kokoro_models/
+piper_models/
 
 # IDEs
 .vscode/

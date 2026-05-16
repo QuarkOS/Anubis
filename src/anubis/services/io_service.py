@@ -1,4 +1,4 @@
-"""Audio and Vision I/O Service for Anubis with VAD, Multi-Monitor, and Wake-Word Support."""
+"""Audio and Vision I/O Service for Anubis with VAD, Multi-Monitor, Wake-Word, and Kokoro TTS."""
 
 import time
 import threading
@@ -12,16 +12,16 @@ from pynput import keyboard
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
-import edge_tts
 import pygame
 import structlog
 import torch
 from faster_whisper import WhisperModel
+from kokoro_onnx import Kokoro
 
 logger = structlog.get_logger(__name__)
 
 class AudioVisionService:
-    """Orchestrates synchronized screen and audio capture with Wake-Word activation."""
+    """Orchestrates synchronized screen and audio capture with Wake-Word activation and local TTS."""
     
     def __init__(self, hotkey='f14', use_vad=True, wake_word="anubis"):
         self.hotkey = hotkey
@@ -43,12 +43,19 @@ class AudioVisionService:
         # VAD State
         self.vad_model = None
         self.is_speech_active = False
-        self.silence_threshold_ms = 800
+        self.silence_threshold_ms = 600 # Faster trigger
         self.last_speech_time = 0
         
-        # Wake Word State
+        # Wake Word & TTS Models
         self.whisper_model = None
-        self.is_waiting_for_command = False # True after wake word is detected
+        self.kokoro = None
+        self.wake_word_alternatives = [
+            "anubis", "a knew this", "i know this", "and boost", 
+            "her now bist", "hey anubis", "hey a knew this", 
+            "annubis", "a newbie", "hi anubis", "hey a noticed",
+            "hey i know this", "here and do this", "here i know this",
+            "heja nugus", "janugus", "now bist", "hey anubus", "hey a nubus"
+        ]
         
         try:
             pygame.mixer.init()
@@ -59,15 +66,22 @@ class AudioVisionService:
             self._init_models()
 
     def _init_models(self):
-        """Initialize VAD and local Whisper for wake-word detection."""
+        """Initialize VAD, Whisper, and Kokoro TTS."""
         try:
             # VAD
             self.vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                                             model='silero_vad',
                                             trust_repo=True)
-            # Whisper Tiny (extremely fast for keyword detection)
-            logger.info("loading_whisper_tiny")
-            self.whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            # Whisper Base
+            logger.info("loading_whisper_base")
+            self.whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+            
+            # Kokoro TTS
+            logger.info("loading_kokoro_tts")
+            model_path = os.path.join("kokoro_models", "kokoro-v1.0.onnx")
+            voices_path = os.path.join("kokoro_models", "voices.bin")
+            self.kokoro = Kokoro(model_path, voices_path)
+            
             logger.info("models_loaded")
         except Exception as e:
             logger.error("model_init_failed", error=str(e))
@@ -78,21 +92,27 @@ class AudioVisionService:
         audio_data = indata.copy()
         self.audio_chunks.append(audio_data)
         
+        # Keep only last 5 seconds of audio in the buffer to prevent memory growth
+        # and ensure we aren't checking ancient audio for wake words.
+        max_chunks = int(5 * self.sample_rate / 512) 
+        if len(self.audio_chunks) > max_chunks:
+            self.audio_chunks.pop(0)
+
         if self.use_vad and self.vad_model:
             tensor_data = torch.from_numpy(audio_data.flatten())
             speech_prob = self.vad_model(tensor_data, self.sample_rate).item()
             
-            if speech_prob > 0.5:
+            if speech_prob > 0.5: # Lowered back slightly for better detection
                 if not self.is_speech_active:
                     self.is_speech_active = True
-                    logger.info("speech_detected")
+                    logger.info("speech_detected", probability=round(speech_prob, 2))
                 self.last_speech_time = time.time()
             else:
                 if self.is_speech_active:
                     elapsed_silence = (time.time() - self.last_speech_time) * 1000
                     if elapsed_silence > self.silence_threshold_ms:
                         self.is_speech_active = False
-                        # Trigger local processing to check for wake-word
+                        # Trigger local processing
                         threading.Thread(target=self._process_voice_trigger, daemon=True).start()
 
     def _process_voice_trigger(self):
@@ -100,29 +120,44 @@ class AudioVisionService:
         if not self.audio_chunks:
             return
 
-        # Prepare audio for Whisper
-        audio_full = np.concatenate(self.audio_chunks, axis=0).flatten()
+        # Snapshot current buffer
+        current_audio = self.audio_chunks[:]
+        audio_full = np.concatenate(current_audio, axis=0).flatten()
         
-        # We check for the wake word in the current buffer
-        segments, _ = self.whisper_model.transcribe(audio_full, beam_size=1)
-        transcript = " ".join([seg.text for segments in segments for seg in [segments]]).lower()
+        # Noise gate
+        if np.max(np.abs(audio_full)) < 0.015:
+            return
+
+        segments, _ = self.whisper_model.transcribe(
+            audio_full, 
+            beam_size=1, 
+            initial_prompt="Anubis, Hey Anubis."
+        )
         
+        transcript = "".join([s.text for s in segments]).strip().lower()
+        
+        if not transcript:
+            return
+
+        # Simple repetition filter
+        words = transcript.split()
+        if len(words) > 8 and any(words.count(w) > (len(words) // 2) for w in set(words)):
+            return
+
         logger.info("transcribed_locally", text=transcript)
 
-        if self.wake_word in transcript:
-            logger.info("wake_word_detected", word=self.wake_word)
-            # 1. Capture Vision
+        if any(word in transcript for word in self.wake_word_alternatives):
+            logger.info("wake_word_detected", matched_transcript=transcript)
             self._capture_vision()
             
-            # 2. Save Audio
+            # Save audio and trigger processing
             sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
             
-            # 3. Trigger Gemini
+            # Clear buffer ONLY on successful detection
+            self.audio_chunks = []
+            
             if self.on_input_ready:
                 self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
-        
-        # Reset chunks for the next listening cycle
-        self.audio_chunks = []
 
     def _capture_vision(self):
         """Capture all monitors."""
@@ -146,7 +181,7 @@ class AudioVisionService:
                     samplerate=self.sample_rate, 
                     channels=self.channels, 
                     callback=self._buffer_audio_stream,
-                    blocksize=1024 
+                    blocksize=512 
                 )
                 self.stream.start()
             except Exception as exc:
@@ -159,33 +194,47 @@ class AudioVisionService:
         self.start_multimodal_capture()
 
     async def speak(self, text: str):
-        """Convert text to speech and play back."""
-        # Stop listening while speaking to avoid feedback loops
+        """Convert text to speech using Kokoro (Streaming Sentences) and play back."""
         if self.stream:
             self.stream.stop()
             
+        # Clean text
         clean_text = re.sub(r'[*`#]', '', text).strip()
-        lang = "en" # Simplified for now
-        voice = "en-US-ChristopherNeural"
         
-        logger.info("generating_tts", voice=voice)
-        audio_file = "anubis_response.mp3"
+        # Split into sentences for pseudo-streaming (minimizes time-to-first-audio)
+        # We split by common sentence enders followed by space or end of string
+        sentences = re.split(r'(?<=[.!?]) +', clean_text)
+        
+        logger.info("generating_kokoro_tts_stream", voice="bf_isabella", sentence_count=len(sentences))
         
         try:
-            communicate = edge_tts.Communicate(clean_text, voice)
-            await communicate.save(audio_file)
-            
-            pygame.mixer.music.load(audio_file)
-            pygame.mixer.music.play()
-            
-            while pygame.mixer.music.get_busy():
-                await asyncio.sleep(0.1)
+            for i, sentence in enumerate(sentences):
+                if not sentence.strip():
+                    continue
+                    
+                # Use 'bf_isabella' (Isabelle British Female)
+                samples, sample_rate = self.kokoro.create(
+                    sentence, 
+                    voice="bf_isabella", 
+                    speed=1.0, 
+                    lang="en-gb"
+                )
+                
+                audio_file = f"anubis_response_seg_{i % 2}.wav" # Alternate files for safety
+                sf.write(audio_file, samples, sample_rate)
+                
+                pygame.mixer.music.load(audio_file)
+                pygame.mixer.music.play()
+                
+                # Wait for the current sentence to finish before starting next generation/playback
+                # (Actual background streaming could be done with a queue, but this is a massive improvement)
+                while pygame.mixer.music.get_busy():
+                    await asyncio.sleep(0.05)
                 
             pygame.mixer.music.unload()
         except Exception as e:
-            logger.error("tts_failed", error=str(e))
+            logger.error("kokoro_tts_failed", error=str(e))
         finally:
-            # Resume listening
             if self.stream:
                 self.stream.start()
-                self.audio_chunks = [] # Clear any feedback audio
+                self.audio_chunks = []

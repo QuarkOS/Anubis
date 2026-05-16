@@ -65,11 +65,12 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
             message=prompt_text,
             model="gemini-3-flash-preview",
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=4096
         )
         response = await agent_service.chat(req)
         current_conversation_id = response.conversation_id
         
+        logger.info("raw_gemini_response", text=response.reply)
         logger.info("anubis_reply", text=response.reply)
         await io_service.speak(response.reply)
         

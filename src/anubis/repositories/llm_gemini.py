@@ -76,6 +76,7 @@ class LLMGeminiProvider(LLMProvider):
             max_output_tokens=max_tokens,
             response_mime_type="application/json" if response_format else "text/plain",
             response_schema=response_format.model_json_schema() if response_format else None,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
         )
 
         try:
