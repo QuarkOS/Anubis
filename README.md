@@ -2,9 +2,9 @@
 
 Anubis is an end-to-end multimodal platform for desktop-integrated intelligence. It provides a comprehensive orchestration framework that enables Gemini 3.0 Flash Preview to interface directly with local system state—specifically screen context and audio input—allowing developers to build and deploy highly contextual AI-powered tools.
 
-Anubis was developed to bridge the gap between high-reasoning LLMs and the local desktop environment. By utilizing a hybrid architecture of a Python-based backend and a Godot-powered Win32 overlay, the platform is versatile enough to be used for productivity assistance, real-time gaming analysis, and UI/UX research.
+Anubis was developed to bridge the gap between high-reasoning LLMs and the local desktop environment. By utilizing a high-performance Python orchestration layer, the platform is versatile enough to be used for productivity assistance, real-time gaming analysis, and general desktop automation.
 
-The platform provides stable Python APIs for multimodal orchestration and an experimental Godot-based visualization layer for real-time feedback.
+The platform provides stable Python APIs for multimodal orchestration. Experimental UI layers using Godot are available in the `experimental` branch.
 
 ## Install
 
@@ -38,8 +38,8 @@ We use GitHub Issues for tracking requests and bugs. The Anubis project strives 
 
 ## Project Structure
 
-*   **src/anubis/**: The core Python orchestration layer handling LLM interop, PTT logic, and TTS.
-*   **shader_test/**: A Godot 4.x project providing a transparent Win32 overlay and experimental shaders.
+*   **src/anubis/**: Core orchestration layer handling LLM interop, PTT logic, and TTS.
+*   **tests/**: Comprehensive test suite for the domain and service layers.
 *   **main_anubis.py**: Entry point for the multimodal assistant.
 
 ## Resources
