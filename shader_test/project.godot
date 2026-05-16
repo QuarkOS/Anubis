@@ -1,0 +1,8 @@
+[config]
+
+name="Shader Test"
+config_version=5
+
+[application]
+
+run/main_scene="res://main.tscn"

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+.pytest_cache/
+*.pyd
+*.so
+
+# Godot
+.godot/
+*.import
+export_presets.cfg
+shader_test/export/
+
+# Project Specific
+anubis_audio_context.wav
+anubis_vision_context.png
+anubis_response.mp3
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+.pytest_cache/
+
+# Audio/Vision Context (Temporary Files)
+anubis_audio_context.wav
+anubis_vision_context.png
+anubis_response.mp3
+
+# IDEs
+.vscode/
+.idea/
+
+# Distribution
+dist/
+build/
+*.egg-info/
