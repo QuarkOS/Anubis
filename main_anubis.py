@@ -86,12 +86,14 @@ def handle_input_ready_sync(audio_path: str, vision_path: str) -> None:
 async def main() -> None:
     """Initialize the assistant and start background input listeners."""
     logger.info("=======================================")
-    logger.info("🌟 ANUBIS VOICE ASSISTANT ONLINE")
+    logger.info("🌟 ANUBIS MULTIMODAL ASSISTANT ONLINE")
     logger.info("=======================================")
-    logger.info(f"Press and hold '{io_service.hotkey}' to speak.")
-    
+    logger.info("Wake Word: 'Anubis'")
+    logger.info("Status: Listening in background...")
+
+    # Start the listening loop
     io_service.listen_in_background(handle_input_ready_sync)
-    
+
     while True:
         await asyncio.sleep(1)
 
