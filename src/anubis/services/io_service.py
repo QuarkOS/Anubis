@@ -10,6 +10,7 @@ import queue
 import threading
 import collections
 import time
+import asyncio
 import numpy as np
 from PIL import Image
 import mss
@@ -20,7 +21,6 @@ import pygame
 import structlog
 import torch
 
-from faster_whisper import WhisperModel
 from openwakeword.model import Model as OWWModel
 from kokoro_onnx import Kokoro
 
@@ -57,6 +57,12 @@ class AudioVisionService:
         self.last_speech_time = 0
         self.silence_threshold_ms = 1000
         
+        # Post-trigger cooldown: block OWW from re-firing immediately after a detection.
+        # Prevents the false-positive loop where ambient noise keeps the score above threshold.
+        self.oww_threshold = 0.70
+        self.last_trigger_time = 0.0
+        self.trigger_cooldown_s = 5.0
+        
         # Callbacks
         self.on_input_ready = None
         self.on_wake_word_detected = None
@@ -72,7 +78,6 @@ class AudioVisionService:
         # Models
         self.oww_model = None
         self.vad_model = None
-        self.whisper_model = None
         self.kokoro = None
         
         try:
@@ -87,17 +92,38 @@ class AudioVisionService:
         """Warm up all local inference models across the parallel pipeline."""
         try:
             logger.info("loading_openwakeword")
-            # Using 'hey_jarvis' as a placeholder to prove the Master-Level Architecture.
-            # Replace with anubis.onnx once custom trained.
-            self.oww_model = OWWModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+            # OpenWakeWord 0.4.0 has a bug where passing wakeword_models as a keyword arg
+            # incorrectly flows into the preprocessor. We pass it as a positional argument.
+            # We also resolve the full path to the built-in 'hey_jarvis' model.
+            import openwakeword
+            
+            # Check for local custom wake words
+            wakewords_dir = os.path.join(os.getcwd(), "wakewords")
+            custom_models = []
+            if os.path.exists(wakewords_dir):
+                custom_models = [os.path.join(wakewords_dir, f) for f in os.listdir(wakewords_dir) if f.endswith(".onnx")]
+                
+            if custom_models:
+                logger.info("loading_custom_wakewords", count=len(custom_models))
+                self.oww_model = OWWModel(custom_models)
+                # Derive a human-readable name from the first model filename
+                first_name = os.path.splitext(os.path.basename(custom_models[0]))[0].replace("_", " ").title()
+                self.wake_word_label = first_name
+            else:
+                paths = openwakeword.get_pretrained_model_paths()
+                jarvis_path = next((p for p in paths if "hey_jarvis" in p), None)
+                if jarvis_path:
+                    self.oww_model = OWWModel([jarvis_path])
+                    self.wake_word_label = "Hey Jarvis"
+                else:
+                    logger.error("no_wakeword_models_found")
+                    self.oww_model = None
+                    self.wake_word_label = "Unknown"
             
             logger.info("loading_silero_vad")
             self.vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                                             model='silero_vad',
                                             trust_repo=True)
-                                            
-            logger.info("loading_whisper_base")
-            self.whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
             
             logger.info("loading_kokoro_tts")
             model_path = os.path.join("kokoro_models", "kokoro-v1.0.onnx")
@@ -132,12 +158,29 @@ class AudioVisionService:
 
             if not self.spooling_command:
                 # STATE: LISTENING FOR WAKE WORD
+                # Enforce post-trigger cooldown to prevent re-fire loops on ambient noise.
+                now = time.time()
+                if (now - self.last_trigger_time) < self.trigger_cooldown_s:
+                    continue
+                    
                 # 1. Instantaneous Inference (<50ms latency)
                 try:
                     prediction = self.oww_model.predict(chunk.flatten())
-                    # Using the hey_jarvis model as our proof-of-concept trigger
-                    if prediction.get('hey_jarvis_v0.1', 0.0) > 0.5:
-                        logger.info("openwakeword_detected", score=prediction['hey_jarvis_v0.1'])
+                    
+                    # Print active scores > 0.30 to let the user calibrate perfectly
+                    for name, score in prediction.items():
+                        if score > 0.3:
+                            logger.info("wakeword_score_debug", model=name, score=float(score), threshold=self.oww_threshold)
+                            
+                    # Trigger threshold (lowered to 0.70 for real-world calibration)
+                    if any(score > self.oww_threshold for score in prediction.values()):
+                        logger.info("openwakeword_detected", scores=prediction)
+                        self.last_trigger_time = now
+                        
+                        # CRITICAL: Reset OWW's internal feature buffer after detection.
+                        # Without this, accumulated activation energy stays "hot" and
+                        # bleeds into all subsequent predictions, causing false cascades.
+                        self.oww_model.reset()
                         
                         if self.on_wake_word_detected:
                             self.on_wake_word_detected() # Instantly trigger hardware UI
@@ -157,7 +200,11 @@ class AudioVisionService:
                 self.command_buffer.append(chunk)
                 
                 # Check VAD for silence
-                tensor_data = torch.from_numpy(chunk.flatten())
+                # Convert int16 chunk to float32 for Silero VAD
+                float_chunk = chunk.flatten().astype(np.float32) / 32768.0
+                # Silero VAD strictly requires 512 samples per chunk at 16kHz.
+                # Since our chunk is 1280 (80ms), we just evaluate the last 32ms.
+                tensor_data = torch.from_numpy(float_chunk[-512:])
                 speech_prob = self.vad_model(tensor_data, self.sample_rate).item()
                 
                 if speech_prob > 0.5:
@@ -183,7 +230,7 @@ class AudioVisionService:
                             self.ring_buffer.clear()
 
     def _process_spooled_command(self, audio_chunks):
-        """Run Faster-Whisper on perfectly segmented audio chunks."""
+        """Prepares audio and vision inputs directly for multimodal Gemini processing."""
         audio_full = np.concatenate(audio_chunks, axis=0).flatten()
         
         # Audio Normalization
@@ -192,20 +239,9 @@ class AudioVisionService:
             return
         audio_full = audio_full / max_vol * 0.9
         
-        logger.info("transcribing_spooled_command")
-        segments, _ = self.whisper_model.transcribe(
-            audio_full, 
-            beam_size=5
-        )
-        
-        transcript = "".join([s.text for s in segments]).strip().lower()
-        if not transcript:
-            return
-            
-        logger.info("transcribed_locally", text=transcript)
-        
-        self._capture_vision()
+        # Save the audio file directly. Gemini will transcribe/understand it multimodally.
         sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
+        self._capture_vision()
         
         if self.on_input_ready:
             self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
@@ -256,6 +292,7 @@ class AudioVisionService:
             self.stream = sd.InputStream(
                 samplerate=self.sample_rate, 
                 channels=self.channels, 
+                dtype='int16',
                 callback=self._audio_callback,
                 blocksize=self.chunk_size
             )

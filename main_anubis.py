@@ -8,6 +8,9 @@ import asyncio
 import os
 import structlog
 
+# Fix for potential OpenMP/Torch runtime conflicts on Windows
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 from anubis.config import get_settings
 from anubis.prompts import PromptRegistry
 from anubis.domain.schemas import ChatRequest
@@ -21,28 +24,11 @@ from anubis.services.visual_feedback import VisualFeedbackService
 
 logger = structlog.get_logger()
 
-settings = get_settings()
-if not settings.llm_api_key:
-    logger.error("Missing ANUBIS_LLM_API_KEY in environment. Terminating.")
-    exit(1)
-
-llm_provider = LLMGeminiProvider(api_key=settings.llm_api_key)
-repo = InMemoryConversationRepository()
-context_builder = SlidingWindowContextBuilder(llm=llm_provider)
-system_probe = WindowsSystemProbe()
-prompts = PromptRegistry()
-visual_feedback = VisualFeedbackService()
-
-agent_service = AgentService(
-    llm=llm_provider,
-    repo=repo,
-    context_builder=context_builder,
-    prompts=prompts,
-    system_probe=system_probe
-)
-io_service = AudioVisionService(hotkey='f14')
-
+# Global pointers to services initialized in main()
 current_conversation_id = None
+agent_service = None
+io_service = None
+visual_feedback = None
 
 
 async def process_captured_media(audio_path: str, vision_path: str) -> None:
@@ -56,7 +42,8 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
     logger.info("input_ready", audio=audio_path, vision=vision_path)
     
     # Transition to 'thinking' (Cyan Aura)
-    visual_feedback.set_state("thinking")
+    if visual_feedback:
+        visual_feedback.set_state("thinking")
     
     prompt_text = f"<file:{audio_path}> <file:{vision_path}>"
     
@@ -75,19 +62,22 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
         logger.info("raw_gemini_response", text=response.reply)
         logger.info("anubis_reply", text=response.reply)
         
-        # Return to idle before speaking (or we could add a 'speaking' state)
-        visual_feedback.set_state("idle")
+        # Return to idle before speaking
+        if visual_feedback:
+            visual_feedback.set_state("idle")
         await io_service.speak(response.reply)
         
     except Exception as e:
-        visual_feedback.set_state("idle")
+        if visual_feedback:
+            visual_feedback.set_state("idle")
         logger.error("anubis_error", error=str(e))
         await io_service.speak("I'm sorry, I encountered an error processing that.")
 
 
 def handle_wake_word_feedback() -> None:
     """Provide immediate visual acknowledgement when the wake word is confirmed."""
-    visual_feedback.set_state("waking")
+    if visual_feedback:
+        visual_feedback.set_state("waking")
 
 
 def handle_input_ready_sync(audio_path: str, vision_path: str) -> None:
@@ -97,10 +87,36 @@ def handle_input_ready_sync(audio_path: str, vision_path: str) -> None:
 
 async def main() -> None:
     """Initialize the service container and start the background multimodal listeners."""
+    global agent_service, io_service, visual_feedback
+    
     logger.info("=======================================")
-    logger.info("🌟 ANUBIS MULTIMODAL ASSISTANT ONLINE")
+    logger.info("* ANUBIS MULTIMODAL ASSISTANT ONLINE *")
     logger.info("=======================================")
-    logger.info("Wake Word: 'Anubis'")
+    
+    settings = get_settings()
+    if not settings.llm_api_key:
+        logger.error("Missing ANUBIS_LLM_API_KEY in environment. Terminating.")
+        return
+
+    # Initialize services inside main to ensure thread/context safety
+    logger.info("initializing_services")
+    llm_provider = LLMGeminiProvider(api_key=settings.llm_api_key)
+    repo = InMemoryConversationRepository()
+    context_builder = SlidingWindowContextBuilder(llm=llm_provider)
+    system_probe = WindowsSystemProbe()
+    prompts = PromptRegistry()
+    
+    agent_service = AgentService(
+        llm=llm_provider,
+        repo=repo,
+        context_builder=context_builder,
+        prompts=prompts,
+        system_probe=system_probe
+    )
+    io_service = AudioVisionService(hotkey='f14')
+
+    wake_label = getattr(io_service, 'wake_word_label', 'Unknown')
+    logger.info(f"Wake Word: '{wake_label}' active")
     logger.info("Status: Listening in background...")
 
     # Start the listening loop with immediate wake-word feedback
@@ -113,8 +129,27 @@ async def main() -> None:
         await asyncio.sleep(1)
 
 
+def run_background_loop():
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
+    import sys
+    import threading
+    from PyQt6.QtWidgets import QApplication
+    
+    # 1. Create Qt application in main thread
+    app = QApplication(sys.argv)
+    
+    # 2. Instantiate UI components in main thread
+    visual_feedback = VisualFeedbackService()
+    
     try:
-        asyncio.run(main())
+        # 3. Start Anubis domain logic in a background thread
+        t = threading.Thread(target=run_background_loop, daemon=True)
+        t.start()
+        
+        # 4. Run Qt Event Loop on the main thread
+        sys.exit(app.exec())
     except KeyboardInterrupt:
         logger.info("Shutting down Anubis...")

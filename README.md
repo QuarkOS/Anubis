@@ -41,6 +41,17 @@ Anubis supports two primary modes of interaction:
 
 Anubis will respond with a concise voice reply through the Kokoro TTS engine.
 
+### Training a Custom Wake Word ("Hey Anubis")
+
+If you want to retrain or update the wake word system, Anubis includes a fully automated training utility script (`train_wakeword.py`). This script dynamically resolves absolute paths, configures the environment (handling Windows encoding quirks), downloads required voice synthesis dependencies (Piper VITS), synthesizes audio datasets, trains the neural classifier, deploys the finalized model, and cleans up the workspace automatically.
+
+To train the custom model:
+```bash
+uv run python train_wakeword.py
+```
+
+This single command handles the entire 6-step machine learning pipeline (approx. 3-5 minutes on CPU). Once finished, your custom model is loaded instantly on the next run!
+
 ## Project Structure
 
 *   **src/anubis/**: Core orchestration layer handling LLM interop, VAD/Wake-word logic, and TTS.

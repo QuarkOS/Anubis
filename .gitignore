@@ -20,9 +20,12 @@ anubis_vision_context.png
 anubis_response.mp3
 anubis_response_seg_*.wav
 
-# Models
+# Models & Training Data
 kokoro_models/
 piper_models/
+data/
+output/
+wakeword.yaml
 
 # IDEs
 .vscode/
