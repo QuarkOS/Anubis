@@ -17,6 +17,7 @@ from anubis.repositories.system_windows import WindowsSystemProbe
 from anubis.services.agent import AgentService
 from anubis.services.context import SlidingWindowContextBuilder
 from anubis.services.io_service import AudioVisionService
+from anubis.services.visual_feedback import VisualFeedbackService
 
 logger = structlog.get_logger()
 
@@ -30,6 +31,7 @@ repo = InMemoryConversationRepository()
 context_builder = SlidingWindowContextBuilder(llm=llm_provider)
 system_probe = WindowsSystemProbe()
 prompts = PromptRegistry()
+visual_feedback = VisualFeedbackService()
 
 agent_service = AgentService(
     llm=llm_provider,
@@ -53,6 +55,10 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
     global current_conversation_id
     logger.info("input_ready", audio=audio_path, vision=vision_path)
     
+    # Visual Feedback: Wake pulse and thinking glow
+    visual_feedback.trigger_wake_pulse()
+    visual_feedback.show_thinking_glow()
+    
     prompt_text = f"<file:{audio_path}> <file:{vision_path}>"
     
     logger.info("anubis_thinking")
@@ -69,9 +75,13 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
         
         logger.info("raw_gemini_response", text=response.reply)
         logger.info("anubis_reply", text=response.reply)
+        
+        # Remove thinking glow before speaking
+        visual_feedback.hide_glow()
         await io_service.speak(response.reply)
         
     except Exception as e:
+        visual_feedback.hide_glow()
         logger.error("anubis_error", error=str(e))
         await io_service.speak("I'm sorry, I encountered an error processing that.")
 
