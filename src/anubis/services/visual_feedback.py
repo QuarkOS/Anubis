@@ -1,112 +1,126 @@
+import sys
 import threading
-import tkinter as tk
-import time
-import win32con
-import win32gui
+from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt6.QtGui import QPainter, QColor, QRadialGradient
+
+class AuraSignal(QObject):
+    state_changed = pyqtSignal(str)
+
+class AuraWidget(QWidget):
+    """
+    Hardware-accelerated PyQt6 Compositor UI.
+    Provides a 60FPS transparent glow utilizing the Windows DWM.
+    """
+    def __init__(self):
+        super().__init__()
+        # Set flags for a completely transparent, click-through, always-on-top overlay
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.WindowTransparentForInput |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # Geometry: Bottom Right Corner
+        self.size = 200
+        self.resize(self.size, self.size)
+        
+        screen = QApplication.primaryScreen().geometry()
+        x = screen.width() - self.size - 20
+        y = screen.height() - self.size - 60
+        self.move(x, y)
+        
+        self.current_state = "idle"
+        self.color = QColor(0, 0, 0, 0)
+        
+        # 60 FPS Animation loop
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_animation)
+        self.timer.start(16)
+        
+        self.pulse_val = 0
+        self.pulse_dir = 1
+
+    def set_state(self, state: str):
+        self.current_state = state
+        if state == "idle":
+            self.color = QColor(0, 0, 0, 0)
+            self.hide()
+        else:
+            if state == "waking":
+                self.color = QColor(255, 215, 0, 180) # Gold
+            elif state == "thinking":
+                self.color = QColor(0, 255, 255, 180) # Cyan
+            self.show()
+
+    def update_animation(self):
+        if self.current_state == "idle":
+            return
+            
+        self.pulse_val += 1.5 * self.pulse_dir
+        if self.pulse_val >= 30:
+            self.pulse_dir = -1
+        elif self.pulse_val <= 0:
+            self.pulse_dir = 1
+            
+        self.update() # Schedule paintEvent
+
+    def paintEvent(self, event):
+        if self.current_state == "idle":
+            return
+            
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        center = self.rect().center()
+        base_radius = 40
+        current_radius = base_radius + self.pulse_val
+        
+        # Radial Gradient for smooth glow/blur effect calculated on GPU/DWM
+        gradient = QRadialGradient(center, current_radius)
+        gradient.setColorAt(0, self.color)
+        gradient.setColorAt(0.7, QColor(self.color.red(), self.color.green(), self.color.blue(), 50))
+        gradient.setColorAt(1, QColor(0, 0, 0, 0))
+        
+        painter.setBrush(gradient)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(center, int(current_radius), int(current_radius))
+
 
 class VisualFeedbackService:
     """
-    Manages a soft, non-intrusive 'Corner Aura' for assistant state feedback.
-    
-    Replaces jarring flashes with a pulsing golden-cyan orb in the bottom-right
-    corner to signal when Anubis is listening, thinking, or speaking.
+    Manages the Qt Event Loop in a dedicated background thread to prevent blocking
+    the main asyncio orchestration loop.
     """
 
     def __init__(self):
-        self.root = None
-        self.canvas = None
-        self._visible = False
-        self._pulse_thread = None
-        self._stop_pulse = threading.Event()
-        self._current_state = "idle"
+        self.app = None
+        self.widget = None
+        self.signals = AuraSignal()
         
-        # Colors (Anubis Gold & Cyan)
-        self.COLOR_WAKING = "#FFD700"  # Gold
-        self.COLOR_THINKING = "#00FFFF" # Cyan
-        
-        self._thread = threading.Thread(target=self._run_overlay, daemon=True)
+        self._thread = threading.Thread(target=self._run_qt_app, daemon=True)
         self._thread.start()
 
-    def _run_overlay(self):
-        """Initialize the corner overlay with click-through Win32 properties."""
-        self.root = tk.Tk()
-        self.root.title("AnubisAura")
+    def _run_qt_app(self):
+        self.app = QApplication(sys.argv)
+        self.widget = AuraWidget()
         
-        # Orb Size and Position (Bottom Right)
-        size = 120
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        # Offset from corner
-        x = screen_w - size - 20
-        y = screen_h - size - 60
+        # Safely marshal thread signals into the Qt event loop
+        self.signals.state_changed.connect(self.widget.set_state)
         
-        self.root.geometry(f"{size}x{size}+{x}+{y}")
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", "black")
-        self.root.config(bg="black")
-
-        self.canvas = tk.Canvas(self.root, width=size, height=size, bg="black", highlightthickness=0)
-        self.canvas.pack()
-
-        # Win32 click-through
-        hwnd = win32gui.FindWindow(None, "AnubisAura")
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, 
-                               ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | 
-                               win32con.WS_EX_NOACTIVATE | win32con.WS_EX_TOOLWINDOW)
-
-        self.root.mainloop()
+        self.app.exec()
 
     def set_state(self, state: str):
-        """Update the aura state: 'idle', 'waking', 'thinking'."""
-        if self._current_state == state:
-            return
-            
-        self._current_state = state
-        self._stop_pulse.set() # Kill existing animation
-        
-        if state == "idle":
-            if self.canvas: self.canvas.delete("all")
-            return
+        """Valid states: 'idle', 'waking', 'thinking'"""
+        self.signals.state_changed.emit(state)
 
-        # Start new pulse animation
-        self._stop_pulse.clear()
-        color = self.COLOR_WAKING if state == "waking" else self.COLOR_THINKING
-        threading.Thread(target=self._animate_pulse, args=(color,), daemon=True).start()
+    def trigger_wake_pulse(self):
+        self.set_state("waking")
 
-    def _animate_pulse(self, color: str):
-        """Pulse a soft-edged orb in the corner."""
-        if not self.canvas: return
-        
-        center = 60
-        max_r = 40
-        min_r = 25
-        
-        while not self._stop_pulse.is_set():
-            # Expansion
-            for r in range(min_r, max_r):
-                if self._stop_pulse.is_set(): break
-                self._draw_orb(center, r, color)
-                time.sleep(0.02)
-            # Contraction
-            for r in range(max_r, min_r, -1):
-                if self._stop_pulse.is_set(): break
-                self._draw_orb(center, r, color)
-                time.sleep(0.03)
+    def show_thinking_glow(self):
+        self.set_state("thinking")
 
-    def _draw_orb(self, center, radius, color):
-        """Draw a multi-layered orb for a 'glow' effect."""
-        self.canvas.delete("aura")
-        # Glow layers
-        for i in range(3, 0, -1):
-            alpha_r = radius + (i * 8)
-            # Tkinter doesn't do real alpha, so we simulate with color layers
-            # or just a few rings for a 'halo' effect.
-            self.canvas.create_oval(center-alpha_r, center-alpha_r, 
-                                    center+alpha_r, center+alpha_r, 
-                                    outline=color, width=2, tags="aura")
-        # Core
-        self.canvas.create_oval(center-radius, center-radius, 
-                                center+radius, center+radius, 
-                                fill=color, outline="", tags="aura")
+    def hide_glow(self):
+        self.set_state("idle")

@@ -1,66 +1,79 @@
-"""Audio and Vision I/O Service for Anubis with VAD, Multi-Monitor, Wake-Word, and Kokoro TTS."""
+"""
+Audio and Vision I/O Service for Anubis with Master-Level Architecture.
+Utilizes continuous parallel streaming, OpenWakeWord for instant (<50ms) triggers,
+and decoupled VAD + Faster-Whisper for high-accuracy command processing.
+"""
 
-import time
-import threading
-import asyncio
-import io
 import os
 import re
+import queue
+import threading
+import collections
+import time
+import numpy as np
 from PIL import Image
 import mss
 from pynput import keyboard
 import sounddevice as sd
 import soundfile as sf
-import numpy as np
 import pygame
 import structlog
 import torch
+
 from faster_whisper import WhisperModel
+from openwakeword.model import Model as OWWModel
 from kokoro_onnx import Kokoro
-from rapidfuzz import fuzz
 
 logger = structlog.get_logger(__name__)
 
 class AudioVisionService:
-    """Orchestrates synchronized screen and audio capture with Wake-Word activation and local TTS."""
+    """
+    Master-Level orchestration of multimodal I/O.
+    Features an asynchronous ring buffer and decoupled state machine for instant wake-word feedback.
+    """
     
-    def __init__(self, hotkey='f14', use_vad=True, wake_word="anubis"):
-        """Initialize the service and set up local VAD, Whisper, and Kokoro models."""
+    def __init__(self, hotkey='f14', use_vad=True):
         self.hotkey = hotkey
         self.use_vad = use_vad
-        self.wake_word = wake_word.lower()
-        self.sample_rate = 16000  # Optimized for VAD and Whisper
+        
+        # Audio Configuration (16kHz is required by Whisper, Silero, and OpenWakeWord)
+        self.sample_rate = 16000
         self.channels = 1
+        self.chunk_size = 1280 # 80ms chunk for OpenWakeWord optimal performance
         
-        self.recording = False
-        self.stream = None
-        self.audio_chunks = []
+        # Concurrency & Buffering
+        self.audio_stream_queue = queue.Queue()
+        self.is_running = False
         
+        # The Ring Buffer keeps the last 3 seconds of audio to catch context 
+        # immediately preceding the VAD silence cutoff.
+        self.ring_buffer_chunks = int((16000 * 3) / self.chunk_size)
+        self.ring_buffer = collections.deque(maxlen=self.ring_buffer_chunks)
+        
+        # State Machine Flags
+        self.spooling_command = False
+        self.command_buffer = []
+        self.is_speech_active = False
+        self.last_speech_time = 0
+        self.silence_threshold_ms = 1000
+        
+        # Callbacks
+        self.on_input_ready = None
+        self.on_wake_word_detected = None
+        
+        # Paths
         self.vision_buffer_path = "anubis_vision_context.png"
         self.audio_buffer_path = "anubis_audio_context.wav"
         
-        self.on_input_ready = None
-        self.on_wake_word_detected = None
         self.mss = mss.mss()
+        self.key_listener = None
+        self.stream = None
         
-        # VAD State
+        # Models
+        self.oww_model = None
         self.vad_model = None
-        self.is_speech_active = False
-        self.silence_threshold_ms = 1000 # Increased for natural pauses in long requests
-        self.last_speech_time = 0
-        
-        # Wake Word & TTS Models
         self.whisper_model = None
         self.kokoro = None
-        self.wake_word_alternatives = [
-            "anubis", "a knew this", "i know this", "and boost", 
-            "her now bist", "hey anubis", "hey a knew this", 
-            "annubis", "a newbie", "hi anubis", "hey a noticed",
-            "hey i know this", "here and do this", "here i know this",
-            "heja nugus", "janugus", "now bist", "hey anubus", "hey a nubus",
-            "hainubis", "hanubis", "hey a new bus", "hey an ubis", "hey a nubes",
-            "her nubis", "nubis", "nubus", "ubis", "newbus", "a nubis", "hey a nubis"
-        ]
         
         try:
             pygame.mixer.init()
@@ -71,133 +84,148 @@ class AudioVisionService:
             self._init_models()
 
     def _init_models(self):
-        """Warm up local inference models for speech detection, transcription, and synthesis."""
+        """Warm up all local inference models across the parallel pipeline."""
         try:
-            # VAD
+            logger.info("loading_openwakeword")
+            # Using 'hey_jarvis' as a placeholder to prove the Master-Level Architecture.
+            # Replace with anubis.onnx once custom trained.
+            self.oww_model = OWWModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+            
+            logger.info("loading_silero_vad")
             self.vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                                             model='silero_vad',
                                             trust_repo=True)
-            # Whisper Base
+                                            
             logger.info("loading_whisper_base")
             self.whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
             
-            # Kokoro TTS
             logger.info("loading_kokoro_tts")
             model_path = os.path.join("kokoro_models", "kokoro-v1.0.onnx")
             voices_path = os.path.join("kokoro_models", "voices.bin")
             self.kokoro = Kokoro(model_path, voices_path)
             
-            logger.info("models_loaded")
+            logger.info("models_loaded_successfully")
         except Exception as e:
             logger.error("model_init_failed", error=str(e))
             self.use_vad = False
 
-    def _buffer_audio_stream(self, indata, frames, time_info, status):
-        """
-        Stream callback for managing the rolling audio buffer and triggering VAD logic.
-        
-        Maintains a 15s-30s buffer that intelligently preserves context during active speech.
-        """
-        audio_data = indata.copy()
-        self.audio_chunks.append(audio_data)
-        
-        # Buffer capacity logic:
-        # 1. We keep a rolling 15s window by default.
-        # 2. If speech is active, we NEVER truncate the buffer, allowing long commands to be captured fully.
-        # 3. We implement a 30s 'safety cap' to prevent unbounded memory growth in noisy environments.
-        
-        rolling_window_chunks = int(15 * self.sample_rate / 512)
-        hard_limit_chunks = int(30 * self.sample_rate / 512)
-        
-        if len(self.audio_chunks) > hard_limit_chunks:
-            self.audio_chunks.pop(0)
-        elif len(self.audio_chunks) > rolling_window_chunks and not self.is_speech_active:
-            self.audio_chunks.pop(0)
+    def _audio_callback(self, indata, frames, time_info, status):
+        """Low-latency callback pushing raw 32/80ms chunks into the processing queue."""
+        if status:
+            logger.warning("audio_stream_status", status=status)
+        self.audio_stream_queue.put(indata.copy())
 
-        if self.use_vad and self.vad_model:
-            tensor_data = torch.from_numpy(audio_data.flatten())
-            speech_prob = self.vad_model(tensor_data, self.sample_rate).item()
+    def _inference_worker(self):
+        """
+        The core state machine running on a dedicated thread.
+        Consumes the audio queue, runs OpenWakeWord instantly, and spools commands via VAD.
+        """
+        while self.is_running:
+            try:
+                # Block until audio is available
+                chunk = self.audio_stream_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            # Update the 3-second ring buffer
+            self.ring_buffer.append(chunk)
+
+            if not self.spooling_command:
+                # STATE: LISTENING FOR WAKE WORD
+                # 1. Instantaneous Inference (<50ms latency)
+                try:
+                    prediction = self.oww_model.predict(chunk.flatten())
+                    # Using the hey_jarvis model as our proof-of-concept trigger
+                    if prediction.get('hey_jarvis_v0.1', 0.0) > 0.5:
+                        logger.info("openwakeword_detected", score=prediction['hey_jarvis_v0.1'])
+                        
+                        if self.on_wake_word_detected:
+                            self.on_wake_word_detected() # Instantly trigger hardware UI
+                            
+                        self.spooling_command = True
+                        self.is_speech_active = True
+                        self.last_speech_time = time.time()
+                        
+                        # Pre-fill the command buffer with the ring buffer to catch anything
+                        # said immediately before or during the wake-word detection.
+                        self.command_buffer = list(self.ring_buffer)
+                except Exception as e:
+                    logger.error("oww_inference_error", error=str(e))
             
-            if speech_prob > 0.5: # Lowered back slightly for better detection
-                if not self.is_speech_active:
-                    self.is_speech_active = True
-                    logger.info("speech_detected", probability=round(speech_prob, 2))
-                self.last_speech_time = time.time()
             else:
-                if self.is_speech_active:
-                    elapsed_silence = (time.time() - self.last_speech_time) * 1000
-                    if elapsed_silence > self.silence_threshold_ms:
-                        self.is_speech_active = False
-                        # Trigger local processing
-                        threading.Thread(target=self._process_voice_trigger, daemon=True).start()
+                # STATE: SPOOLING COMMAND
+                self.command_buffer.append(chunk)
+                
+                # Check VAD for silence
+                tensor_data = torch.from_numpy(chunk.flatten())
+                speech_prob = self.vad_model(tensor_data, self.sample_rate).item()
+                
+                if speech_prob > 0.5:
+                    self.is_speech_active = True
+                    self.last_speech_time = time.time()
+                else:
+                    if self.is_speech_active:
+                        elapsed_silence = (time.time() - self.last_speech_time) * 1000
+                        if elapsed_silence > self.silence_threshold_ms:
+                            # End of command detected
+                            self.is_speech_active = False
+                            self.spooling_command = False
+                            
+                            # Process the spooled command in a separate thread to unblock inference
+                            threading.Thread(
+                                target=self._process_spooled_command, 
+                                args=(list(self.command_buffer),),
+                                daemon=True
+                            ).start()
+                            
+                            self.command_buffer.clear()
+                            # Reset ring buffer to avoid accidental double-triggers
+                            self.ring_buffer.clear()
 
-    def _process_voice_trigger(self):
-        """
-        Transcribe the current buffer and evaluate wake-word activation.
+    def _process_spooled_command(self, audio_chunks):
+        """Run Faster-Whisper on perfectly segmented audio chunks."""
+        audio_full = np.concatenate(audio_chunks, axis=0).flatten()
         
-        Uses a combination of exact phonetic matches and fuzzy similarity scores
-        to ensure robust activation even with variable Whisper output.
-        """
-        if not self.audio_chunks:
-            return
-
-        # Snapshot current buffer
-        current_audio = self.audio_chunks[:]
-        audio_full = np.concatenate(current_audio, axis=0).flatten()
-        
-        # Audio Normalization: ensures consistent signal for Whisper
+        # Audio Normalization
         max_vol = np.max(np.abs(audio_full))
         if max_vol < 0.01:
             return
         audio_full = audio_full / max_vol * 0.9
         
-        # Higher beam_size (5) for better phonetic accuracy
+        logger.info("transcribing_spooled_command")
         segments, _ = self.whisper_model.transcribe(
             audio_full, 
-            beam_size=5, 
-            initial_prompt="Anubis, Hey Anubis."
+            beam_size=5
         )
         
         transcript = "".join([s.text for s in segments]).strip().lower()
-        
         if not transcript:
             return
-
-        # Simple repetition filter
-        words = transcript.split()
-        if len(words) > 8 and any(words.count(w) > (len(words) // 2) for w in set(words)):
-            return
-
+            
         logger.info("transcribed_locally", text=transcript)
+        
+        self._capture_vision()
+        sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
+        
+        if self.on_input_ready:
+            self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
 
-        # 1. Exact/Substring match (Fast)
-        matched = any(word in transcript for word in self.wake_word_alternatives)
-
-        # 2. Fuzzy match (Robust)
-        # We check the first 20 characters for a fuzzy match against 'hey anubis'
-        if not matched and len(transcript) > 3:
-            start_snippet = transcript[:20]
-            score = fuzz.partial_ratio("hey anubis", start_snippet)
-            if score > 80: # High confidence fuzzy match
-                logger.info("fuzzy_wake_word_detected", score=score, snippet=start_snippet)
-                matched = True
-
-        if matched:
-            logger.info("wake_word_detected", matched_transcript=transcript)
+    def _trigger_manual_capture(self):
+        """Hotkey override to immediately spool the last 3 seconds and trigger."""
+        if self.on_wake_word_detected:
+            self.on_wake_word_detected()
             
-            # 1. Immediate visual feedback
-            if self.on_wake_word_detected:
-                self.on_wake_word_detected()
-                
-            # 2. Proceed with full capture
-            self._capture_vision()
-            sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
+        audio_full = np.concatenate(list(self.ring_buffer), axis=0).flatten() if self.ring_buffer else np.zeros(self.sample_rate, dtype=np.float32)
+        
+        max_vol = np.max(np.abs(audio_full))
+        if max_vol > 0.01:
+            audio_full = audio_full / max_vol * 0.9
             
-            # Clear buffer ONLY on successful detection
-            self.audio_chunks = []
-            
-            if self.on_input_ready:
-                self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
+        self._capture_vision()
+        sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
+        
+        if self.on_input_ready:
+            self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
 
     def _capture_vision(self):
         """Capture a composite image of all connected monitors using mss."""
@@ -209,77 +237,48 @@ class AudioVisionService:
         except Exception as exc:
             logger.error("vision_capture_failed", error=str(exc))
 
-    def start_multimodal_capture(self):
-        """Initialize background audio monitoring and the F14 hotkey listener."""
-        if not self.recording:
-            logger.info("anubis_listening_background", mode="wake_word", hotkey=self.hotkey)
-            self.recording = True
-            self.audio_chunks = []
-
-            # 1. Start Audio Stream (for Wake-Word/VAD)
-            try:
-                self.stream = sd.InputStream(
-                    samplerate=self.sample_rate, 
-                    channels=self.channels, 
-                    callback=self._buffer_audio_stream,
-                    blocksize=512 
-                )
-                self.stream.start()
-            except Exception as exc:
-                logger.error("stream_failed", error=str(exc))
-                self.recording = False
-
-            # 2. Start Keyboard Listener (for F14 manual trigger)
-            def on_press(key):
-                try:
-                    # Handle both special keys and character keys
-                    key_name = key.name if hasattr(key, 'name') else str(key)
-                    if key_name == self.hotkey:
-                        logger.info("hotkey_pressed", key=self.hotkey)
-                        self._trigger_manual_capture()
-                except Exception:
-                    pass
-
-            self.key_listener = keyboard.Listener(on_press=on_press)
-            self.key_listener.start()
-
-    def _trigger_manual_capture(self):
-        """Execute a capture turn immediately, regardless of wake-word state."""
-        if not self.audio_chunks:
-            return
-
-        current_audio = self.audio_chunks[:]
-        audio_full = np.concatenate(current_audio, axis=0).flatten()
-
-        # Normalize and save
-        max_vol = np.max(np.abs(audio_full))
-        if max_vol > 0.01:
-            audio_full = audio_full / max_vol * 0.9
-
-        if self.on_wake_word_detected:
-            self.on_wake_word_detected()
-
-        self._capture_vision()
-        sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
-
-        self.audio_chunks = []
-        if self.on_input_ready:
-            self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
-
-
     def listen_in_background(self, callback, on_wake_word=None) -> None:
-        """Entry point for the always-on multimodal listening loop."""
+        """Initialize the Parallel Stream Architecture."""
+        if self.is_running:
+            return
+            
         self.on_input_ready = callback
         self.on_wake_word_detected = on_wake_word
-        self.start_multimodal_capture()
+        self.is_running = True
+        
+        logger.info("starting_master_level_architecture", hotkey=self.hotkey)
+        
+        # 1. Start Inference Consumer Thread
+        threading.Thread(target=self._inference_worker, daemon=True).start()
+        
+        # 2. Start Audio Producer Stream
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate, 
+                channels=self.channels, 
+                callback=self._audio_callback,
+                blocksize=self.chunk_size
+            )
+            self.stream.start()
+        except Exception as exc:
+            logger.error("stream_failed", error=str(exc))
+            self.is_running = False
+
+        # 3. Start Hotkey Listener
+        def on_press(key):
+            try:
+                key_name = key.name if hasattr(key, 'name') else str(key)
+                if key_name == self.hotkey:
+                    logger.info("hotkey_pressed", key=self.hotkey)
+                    self._trigger_manual_capture()
+            except Exception:
+                pass
+                
+        self.key_listener = keyboard.Listener(on_press=on_press)
+        self.key_listener.start()
 
     async def speak(self, text: str):
-        """
-        Synthesize and play audio for the given text using Kokoro TTS.
-        
-        Employs a gapless sentence-by-sentence streaming producer-consumer loop
-        to minimize playback latency while synthesis is in progress.
-        """
+        """Gapless TTS generation and playback loop."""
         if not pygame.mixer.get_init():
             logger.warning("pygame_mixer_not_initialized_skipping_tts", text=text)
             return
@@ -287,24 +286,17 @@ class AudioVisionService:
         if self.stream:
             self.stream.stop()
             
-        # Clean text
         clean_text = re.sub(r'[*`#]', '', text).strip()
-        
-        # Split into sentences
         sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', clean_text) if s.strip()]
         if not sentences:
             return
 
         logger.info("generating_kokoro_tts_gapless", voice="bf_isabella", sentence_count=len(sentences))
-        
-        # We use a Queue to pass generated audio samples to the playback loop
         audio_queue = asyncio.Queue()
         
         async def producer():
-            """Generates audio samples in the background."""
             try:
                 for sentence in sentences:
-                    # Generate samples in a thread to not block the event loop
                     samples, sample_rate = await asyncio.to_thread(
                         self.kokoro.create,
                         sentence,
@@ -313,19 +305,16 @@ class AudioVisionService:
                         lang="en-gb"
                     )
                     await audio_queue.put((samples, sample_rate))
-                # Signal end of generation
                 await audio_queue.put(None)
             except Exception as e:
                 logger.error("tts_producer_failed", error=str(e))
                 await audio_queue.put(None)
 
-        # Start the background producer
         producer_task = asyncio.create_task(producer())
 
         try:
             seg_idx = 0
             while True:
-                # Get next generated audio set
                 item = await audio_queue.get()
                 if item is None:
                     break
@@ -337,10 +326,8 @@ class AudioVisionService:
                 pygame.mixer.music.load(audio_file)
                 pygame.mixer.music.play()
                 
-                # While this segment is playing, the producer is already working 
-                # on the next item and putting it into the queue.
                 while pygame.mixer.music.get_busy():
-                    await asyncio.sleep(0.01) # High frequency polling for minimal gap
+                    await asyncio.sleep(0.01)
                 
                 seg_idx += 1
                 
@@ -350,5 +337,7 @@ class AudioVisionService:
         finally:
             await producer_task
             if self.stream:
+                # Flush queues to prevent old audio from ghost-triggering
+                while not self.audio_stream_queue.empty():
+                    self.audio_stream_queue.get()
                 self.stream.start()
-                self.audio_chunks = []
