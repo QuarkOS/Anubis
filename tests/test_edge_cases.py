@@ -199,22 +199,25 @@ async def test_gemini_provider_token_count_usage_metadata() -> None:
         
         provider = LLMGeminiProvider(api_key=api_key)
         
-        # Mock API Response
-        mock_candidate = MagicMock()
-        mock_candidate.finish_reason = "STOP"
-        mock_candidate.content.parts = [MagicMock(text="Gemini Answer")]
+        # Mock API Response for interactions
+        mock_part = MagicMock()
+        mock_part.text = "Gemini Answer"
         
-        mock_response = MagicMock()
-        mock_response.candidates = [mock_candidate]
-        mock_response.text = "Gemini Answer"
+        mock_step = MagicMock()
+        mock_step.type = "model_output"
+        mock_step.content = [mock_part]
         
         # Populate real usage metadata
         mock_usage = MagicMock()
-        mock_usage.prompt_token_count = 105
-        mock_usage.candidates_token_count = 42
-        mock_response.usage_metadata = mock_usage
+        mock_usage.total_input_tokens = 105
+        mock_usage.total_output_tokens = 42
         
-        mock_client.models.generate_content.return_value = mock_response
+        mock_interaction = MagicMock()
+        mock_interaction.steps = [mock_step]
+        mock_interaction.status = "completed"
+        mock_interaction.usage = mock_usage
+        
+        mock_client.interactions.create.return_value = mock_interaction
         
         messages = [Message(role=Role.USER, content="Tell me a joke.")]
         result = await provider.generate_response(messages)
@@ -250,12 +253,20 @@ async def test_gemini_provider_file_uploader_filter() -> None:
             mock_uploaded_file.mime_type = "image/png"
             mock_client.files.upload.return_value = mock_uploaded_file
 
-            # Mock generate_content
-            mock_client.models.generate_content.return_value = MagicMock(
-                candidates=[MagicMock(content=MagicMock(parts=[MagicMock(text="Processed")]))],
-                text="Processed",
-                usage_metadata=None
-            )
+            # Mock interactions.create
+            mock_part = MagicMock()
+            mock_part.text = "Processed"
+            
+            mock_step = MagicMock()
+            mock_step.type = "model_output"
+            mock_step.content = [mock_part]
+            
+            mock_interaction = MagicMock()
+            mock_interaction.steps = [mock_step]
+            mock_interaction.status = "completed"
+            mock_interaction.usage = None
+            
+            mock_client.interactions.create.return_value = mock_interaction
             
             # Message referencing a real file, a directory, and a missing path
             messages = [

@@ -32,16 +32,18 @@ class LLMGeminiProvider(LLMProvider):
         response_format: type | None = None,
     ) -> CompletionResult:
         """
-        Execute a multimodal generation turn, automatically uploading local file references.
-        
-        Parses the latest user message for <file:path> tags, uploads identified 
-        media to the Gemini File API, and injects them as active context parts.
+        Execute a multimodal generation turn using the experimental premium Flex interactions tier,
+        automatically uploading local file references.
         """
+        system_instruction = None
+        user_model_steps = []
         
-        gemini_contents = []
         for i, msg in enumerate(messages):
-            role = "user" if msg.role in (Role.USER, Role.SYSTEM) else "model"
-            
+            if msg.role == Role.SYSTEM:
+                system_instruction = msg.content
+                continue
+                
+            role = "user_input" if msg.role == Role.USER else "model_output"
             parts = []
             text_content = msg.content
             
@@ -53,43 +55,67 @@ class LLMGeminiProvider(LLMProvider):
                     if os.path.isfile(file_path):
                         logger.info("gemini_uploading_file", file=file_path)
                         uploaded_file = self.client.files.upload(file=file_path)
-                        file_part = types.Part(
-                            file_data=types.FileData(
-                                file_uri=uploaded_file.uri, 
-                                mime_type=uploaded_file.mime_type
-                            )
-                        )
-                        parts.append(file_part)
+                        mime = uploaded_file.mime_type or ""
+                        if "audio" in mime:
+                            parts.append({
+                                "type": "audio",
+                                "uri": uploaded_file.uri,
+                                "mime_type": mime
+                            })
+                        elif "image" in mime:
+                            parts.append({
+                                "type": "image",
+                                "uri": uploaded_file.uri,
+                                "mime_type": mime
+                            })
+                        else:
+                            parts.append({
+                                "type": "document",
+                                "uri": uploaded_file.uri,
+                                "mime_type": mime
+                            })
                     else:
                         logger.warning("gemini_file_missing_or_not_file", file=file_path)
             
             cleaned_text = FILE_TAG_PATTERN.sub("", text_content).strip()
             if cleaned_text:
-                parts.append(types.Part(text=cleaned_text))
+                parts.append({"type": "text", "text": cleaned_text})
                 
-            if not parts:
-                continue
+            if parts:
+                user_model_steps.append({
+                    "type": role,
+                    "content": parts
+                })
+                
+        if not user_model_steps:
+            user_model_steps = [{"type": "user_input", "content": [{"type": "text", "text": "Hello"}]}]
 
-            gemini_contents.append(
-                types.Content(
-                    role=role,
-                    parts=parts
-                )
-            )
-
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            response_mime_type="application/json" if response_format else "text/plain",
-            response_schema=response_format.model_json_schema() if response_format else None,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-        )
+        response_format_arg = None
+        if response_format:
+            response_format_arg = {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": response_format.model_json_schema()
+            }
+            
+        response_mime_type = "application/json" if response_format else "text/plain"
+        tools_arg = [{"type": "google_search"}]
+        
+        generation_config = {
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
 
         try:
-            response = self.client.models.generate_content(
+            interaction = self.client.interactions.create(
                 model=model,
-                contents=gemini_contents,
-                config=config,
+                input=user_model_steps,
+                service_tier='flex',
+                generation_config=generation_config,
+                system_instruction=system_instruction,
+                response_format=response_format_arg,
+                response_mime_type=response_mime_type,
+                tools=tools_arg,
             )
         except Exception as e:
             err_str = str(e).lower()
@@ -98,25 +124,23 @@ class LLMGeminiProvider(LLMProvider):
             raise LLMResponseError(f"Gemini API Error: {e}") from e
 
         full_text = ""
-        finish_reason = "unknown"
-        if response.candidates:
-            candidate = response.candidates[0]
-            finish_reason = str(getattr(candidate, 'finish_reason', 'unknown'))
-            if candidate.content and candidate.content.parts:
+        for step in reversed(interaction.steps):
+            if step.type == "model_output" and hasattr(step, "content") and step.content:
                 full_text = "".join(
-                    part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text
+                    part.text for part in step.content if hasattr(part, "text") and part.text
                 )
-        
+                if full_text:
+                    break
         if not full_text:
-            full_text = response.text or ""
+            full_text = interaction.steps[-1].content[0].text if (interaction.steps and interaction.steps[-1].content) else ""
         
-        logger.info("gemini_response", finish_reason=finish_reason, text_length=len(full_text))
+        logger.info("gemini_response", status=interaction.status, text_length=len(full_text))
 
         prompt_tokens = 0
         completion_tokens = 0
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-            completion_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+        if hasattr(interaction, "usage") and interaction.usage:
+            prompt_tokens = getattr(interaction.usage, "total_input_tokens", 0) or 0
+            completion_tokens = getattr(interaction.usage, "total_output_tokens", 0) or 0
 
         return CompletionResult(
             content=full_text,
