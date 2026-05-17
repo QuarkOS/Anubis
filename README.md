@@ -1,16 +1,18 @@
 # Anubis: A Multimodal Desktop Assistant Platform
 
-Anubis is an end-to-end multimodal platform for desktop-integrated intelligence. It provides a comprehensive orchestration framework that enables Gemini 3.0 Flash Preview to interface directly with local system state—specifically screen context and audio input—allowing developers to build and deploy highly contextual AI-powered tools.
+Anubis is an end-to-end multimodal platform for desktop-integrated intelligence. It provides a comprehensive orchestration framework that enables Gemini 3.0 Flash Preview to interface directly with local system state—specifically screen context, audio input, and real-time telemetry—allowing developers to build and deploy highly contextual AI-powered tools.
 
-Anubis was developed to bridge the gap between high-reasoning LLMs and the local desktop environment. By utilizing a high-performance Python orchestration layer, the platform is versatile enough to be used for productivity assistance, real-time gaming analysis, and general desktop automation.
+## Key Features
 
-The platform provides stable Python APIs for multimodal orchestration. Experimental UI layers using Godot are available in the `experimental` branch.
+*   **Hands-Free Wake-Word:** Always-on background listening with robust fuzzy matching for "Hey Anubis".
+*   **Manual Hotkey (F14):** Immediate multimodal capture using the `F14` key for precise control in any environment.
+*   **System Situational Awareness:** Real-time monitoring of CPU, GPU (NVIDIA), RAM, Network throughput, and Clipboard content.
+*   **Local Multimodal Pipeline:** Utilizes Silero VAD, Faster-Whisper, and Kokoro TTS for low-latency local processing.
+*   **Multi-Monitor Vision:** Captures all connected displays to provide full visual context to the model.
 
 ## Install
 
-See the Anubis install guide for detailed environment setup. The project utilizes `uv` for high-performance dependency management.
-
-To install the current release and its dependencies:
+The project utilizes `uv` for high-performance dependency management.
 
 ```bash
 uv sync
@@ -22,31 +24,33 @@ Ensure you have a Google Gemini API key configured in your environment variables
 ANUBIS_LLM_API_KEY=your_api_key_here
 ```
 
-## Try your first Anubis session
+## Usage
+
+### Start Anubis
 
 ```bash
 uv run python main_anubis.py
 ```
 
-Once initialized, press and hold the `F14` key to capture your current screen and audio. Release the key to send the multimodal context to the model and receive a concise voice response.
+### Interactions
 
-## Contribution guidelines
+Anubis supports two primary modes of interaction:
 
-If you want to contribute to Anubis, be sure to review the Contribution Guidelines. This project adheres to a professional Code of Conduct. By participating, you are expected to uphold this code.
+1.  **Voice Activation:** Simply say **"Hey Anubis"** followed by your request. Anubis uses fuzzy phonetic matching to ensure it hears you even in noisy environments.
+2.  **Manual Trigger (F14):** Press the **`F14`** key to immediately capture your current screen and the last 15 seconds of audio. This is ideal for quick "What's this?" questions or when you prefer not to use the wake word.
 
-We use GitHub Issues for tracking requests and bugs. The Anubis project strives to abide by generally accepted best practices in open-source software development.
+Anubis will respond with a concise voice reply through the Kokoro TTS engine.
 
 ## Project Structure
 
-*   **src/anubis/**: Core orchestration layer handling LLM interop, PTT logic, and TTS.
-*   **tests/**: Comprehensive test suite for the domain and service layers.
+*   **src/anubis/**: Core orchestration layer handling LLM interop, VAD/Wake-word logic, and TTS.
+*   **src/anubis/repositories/system_windows.py**: Windows-specific telemetry probe for hardware and user context.
+*   **tests/**: Comprehensive test suite for system awareness and agent logic.
 *   **main_anubis.py**: Entry point for the multimodal assistant.
 
-## Resources
+## Engineering Standards
 
-*   Google GenAI Documentation
-*   Godot Engine Documentation
-*   Edge-TTS Repository
+This project follows the senior-level guidelines documented in [COMMENTING_STANDARDS.md](./COMMENTING_STANDARDS.md), prioritizing naming clarity and concise, high-signal documentation.
 
 ## License
 

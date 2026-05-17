@@ -205,12 +205,13 @@ class AudioVisionService:
             logger.error("vision_capture_failed", error=str(exc))
 
     def start_multimodal_capture(self):
-        """Initialize the background audio stream and begin VAD monitoring."""
+        """Initialize background audio monitoring and the F14 hotkey listener."""
         if not self.recording:
-            logger.info("anubis_listening_background", mode="wake_word")
+            logger.info("anubis_listening_background", mode="wake_word", hotkey=self.hotkey)
             self.recording = True
             self.audio_chunks = []
-            
+
+            # 1. Start Audio Stream (for Wake-Word/VAD)
             try:
                 self.stream = sd.InputStream(
                     samplerate=self.sample_rate, 
@@ -222,6 +223,41 @@ class AudioVisionService:
             except Exception as exc:
                 logger.error("stream_failed", error=str(exc))
                 self.recording = False
+
+            # 2. Start Keyboard Listener (for F14 manual trigger)
+            def on_press(key):
+                try:
+                    # Handle both special keys and character keys
+                    key_name = key.name if hasattr(key, 'name') else str(key)
+                    if key_name == self.hotkey:
+                        logger.info("hotkey_pressed", key=self.hotkey)
+                        self._trigger_manual_capture()
+                except Exception:
+                    pass
+
+            self.key_listener = keyboard.Listener(on_press=on_press)
+            self.key_listener.start()
+
+    def _trigger_manual_capture(self):
+        """Execute a capture turn immediately, regardless of wake-word state."""
+        if not self.audio_chunks:
+            return
+
+        current_audio = self.audio_chunks[:]
+        audio_full = np.concatenate(current_audio, axis=0).flatten()
+
+        # Normalize and save
+        max_vol = np.max(np.abs(audio_full))
+        if max_vol > 0.01:
+            audio_full = audio_full / max_vol * 0.9
+
+        self._capture_vision()
+        sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
+
+        self.audio_chunks = []
+        if self.on_input_ready:
+            self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
+
 
     def listen_in_background(self, callback) -> None:
         """Entry point for the always-on multimodal listening loop."""
