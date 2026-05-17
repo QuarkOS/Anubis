@@ -40,6 +40,7 @@ class AudioVisionService:
         self.audio_buffer_path = "anubis_audio_context.wav"
         
         self.on_input_ready = None
+        self.on_wake_word_detected = None
         self.mss = mss.mss()
         
         # VAD State
@@ -183,9 +184,13 @@ class AudioVisionService:
 
         if matched:
             logger.info("wake_word_detected", matched_transcript=transcript)
-            self._capture_vision()
             
-            # Save audio and trigger processing
+            # 1. Immediate visual feedback
+            if self.on_wake_word_detected:
+                self.on_wake_word_detected()
+                
+            # 2. Proceed with full capture
+            self._capture_vision()
             sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
             
             # Clear buffer ONLY on successful detection
@@ -251,6 +256,9 @@ class AudioVisionService:
         if max_vol > 0.01:
             audio_full = audio_full / max_vol * 0.9
 
+        if self.on_wake_word_detected:
+            self.on_wake_word_detected()
+
         self._capture_vision()
         sf.write(self.audio_buffer_path, audio_full, self.sample_rate)
 
@@ -259,9 +267,10 @@ class AudioVisionService:
             self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
 
 
-    def listen_in_background(self, callback) -> None:
+    def listen_in_background(self, callback, on_wake_word=None) -> None:
         """Entry point for the always-on multimodal listening loop."""
         self.on_input_ready = callback
+        self.on_wake_word_detected = on_wake_word
         self.start_multimodal_capture()
 
     async def speak(self, text: str):

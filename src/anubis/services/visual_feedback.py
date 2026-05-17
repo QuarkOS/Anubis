@@ -1,101 +1,112 @@
 import threading
 import tkinter as tk
 import time
-import win32api
 import win32con
 import win32gui
 
 class VisualFeedbackService:
     """
-    Manages a transparent, click-through overlay for real-time visual feedback.
+    Manages a soft, non-intrusive 'Corner Aura' for assistant state feedback.
     
-    Provides 'Spectral Glow' effects to signal assistant state (Waking, Thinking, Speaking)
-    without interrupting the user's workflow or stealing window focus.
+    Replaces jarring flashes with a pulsing golden-cyan orb in the bottom-right
+    corner to signal when Anubis is listening, thinking, or speaking.
     """
 
     def __init__(self):
         self.root = None
         self.canvas = None
-        self._thread = threading.Thread(target=self._run_overlay, daemon=True)
         self._visible = False
-        self._pulse_active = False
+        self._pulse_thread = None
+        self._stop_pulse = threading.Event()
+        self._current_state = "idle"
+        
+        # Colors (Anubis Gold & Cyan)
+        self.COLOR_WAKING = "#FFD700"  # Gold
+        self.COLOR_THINKING = "#00FFFF" # Cyan
+        
+        self._thread = threading.Thread(target=self._run_overlay, daemon=True)
         self._thread.start()
 
     def _run_overlay(self):
-        """Initialize the transparent tkinter window and Win32 click-through properties."""
+        """Initialize the corner overlay with click-through Win32 properties."""
         self.root = tk.Tk()
-        self.root.title("AnubisOverlay")
+        self.root.title("AnubisAura")
         
-        # Geometry: Full screen
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        self.root.geometry(f"{screen_width}x{screen_height}+0+0")
+        # Orb Size and Position (Bottom Right)
+        size = 120
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        # Offset from corner
+        x = screen_w - size - 20
+        y = screen_h - size - 60
         
-        # Transparency and Z-Order
+        self.root.geometry(f"{size}x{size}+{x}+{y}")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparentcolor", "black")
         self.root.config(bg="black")
 
-        self.canvas = tk.Canvas(self.root, width=screen_width, height=screen_height, bg="black", highlightthickness=0)
+        self.canvas = tk.Canvas(self.root, width=size, height=size, bg="black", highlightthickness=0)
         self.canvas.pack()
 
-        # Win32 magic to make it click-through and truly transparent to events
-        hwnd = win32gui.FindWindow(None, "AnubisOverlay")
+        # Win32 click-through
+        hwnd = win32gui.FindWindow(None, "AnubisAura")
         ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        # WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
         win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, 
                                ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | 
                                win32con.WS_EX_NOACTIVATE | win32con.WS_EX_TOOLWINDOW)
 
         self.root.mainloop()
 
-    def trigger_wake_pulse(self):
-        """Flash a golden-cyan border pulse across the screen edges."""
-        if not self.canvas: return
-        threading.Thread(target=self._animate_pulse, daemon=True).start()
-
-    def show_thinking_glow(self):
-        """Show a persistent subtle glow at the bottom of the screen."""
-        self._visible = True
-        self._draw_state("thinking")
-
-    def hide_glow(self):
-        """Remove all active overlays."""
-        self._visible = False
-        if self.canvas:
-            self.canvas.delete("all")
-
-    def _animate_pulse(self):
-        """Run the pulse animation frame-by-frame on the tkinter canvas."""
-        w = self.root.winfo_screenwidth()
-        h = self.root.winfo_screenheight()
-        
-        # Colors: Anubis Gold/Cyan
-        colors = ["#FFD700", "#00FFFF", "#FFD700"]
-        
-        for i in range(1, 15):
-            thickness = i * 2
-            self.canvas.delete("pulse")
-            # Draw rectangles for the pulse effect
-            self.canvas.create_rectangle(0, 0, w, h, outline=colors[i % 2], width=thickness, tags="pulse")
-            time.sleep(0.02)
+    def set_state(self, state: str):
+        """Update the aura state: 'idle', 'waking', 'thinking'."""
+        if self._current_state == state:
+            return
             
-        for i in range(15, 0, -1):
-            thickness = i * 2
-            self.canvas.delete("pulse")
-            self.canvas.create_rectangle(0, 0, w, h, outline="#FFD700", width=thickness, tags="pulse")
-            time.sleep(0.02)
-            
-        self.canvas.delete("pulse")
+        self._current_state = state
+        self._stop_pulse.set() # Kill existing animation
+        
+        if state == "idle":
+            if self.canvas: self.canvas.delete("all")
+            return
 
-    def _draw_state(self, state: str):
-        """Update the canvas with state-specific visual cues."""
+        # Start new pulse animation
+        self._stop_pulse.clear()
+        color = self.COLOR_WAKING if state == "waking" else self.COLOR_THINKING
+        threading.Thread(target=self._animate_pulse, args=(color,), daemon=True).start()
+
+    def _animate_pulse(self, color: str):
+        """Pulse a soft-edged orb in the corner."""
         if not self.canvas: return
-        w = self.root.winfo_screenwidth()
-        h = self.root.winfo_screenheight()
-        self.canvas.delete("state")
+        
+        center = 60
+        max_r = 40
+        min_r = 25
+        
+        while not self._stop_pulse.is_set():
+            # Expansion
+            for r in range(min_r, max_r):
+                if self._stop_pulse.is_set(): break
+                self._draw_orb(center, r, color)
+                time.sleep(0.02)
+            # Contraction
+            for r in range(max_r, min_r, -1):
+                if self._stop_pulse.is_set(): break
+                self._draw_orb(center, r, color)
+                time.sleep(0.03)
 
-        if state == "thinking":
-            # Subtle golden bar at bottom
-            self.canvas.create_rectangle(w//4, h-5, 3*w//4, h, fill="#FFD700", outline="", tags="state")
+    def _draw_orb(self, center, radius, color):
+        """Draw a multi-layered orb for a 'glow' effect."""
+        self.canvas.delete("aura")
+        # Glow layers
+        for i in range(3, 0, -1):
+            alpha_r = radius + (i * 8)
+            # Tkinter doesn't do real alpha, so we simulate with color layers
+            # or just a few rings for a 'halo' effect.
+            self.canvas.create_oval(center-alpha_r, center-alpha_r, 
+                                    center+alpha_r, center+alpha_r, 
+                                    outline=color, width=2, tags="aura")
+        # Core
+        self.canvas.create_oval(center-radius, center-radius, 
+                                center+radius, center+radius, 
+                                fill=color, outline="", tags="aura")

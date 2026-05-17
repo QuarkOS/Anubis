@@ -55,9 +55,8 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
     global current_conversation_id
     logger.info("input_ready", audio=audio_path, vision=vision_path)
     
-    # Visual Feedback: Wake pulse and thinking glow
-    visual_feedback.trigger_wake_pulse()
-    visual_feedback.show_thinking_glow()
+    # Transition to 'thinking' (Cyan Aura)
+    visual_feedback.set_state("thinking")
     
     prompt_text = f"<file:{audio_path}> <file:{vision_path}>"
     
@@ -76,14 +75,19 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
         logger.info("raw_gemini_response", text=response.reply)
         logger.info("anubis_reply", text=response.reply)
         
-        # Remove thinking glow before speaking
-        visual_feedback.hide_glow()
+        # Return to idle before speaking (or we could add a 'speaking' state)
+        visual_feedback.set_state("idle")
         await io_service.speak(response.reply)
         
     except Exception as e:
-        visual_feedback.hide_glow()
+        visual_feedback.set_state("idle")
         logger.error("anubis_error", error=str(e))
         await io_service.speak("I'm sorry, I encountered an error processing that.")
+
+
+def handle_wake_word_feedback() -> None:
+    """Provide immediate visual acknowledgement when the wake word is confirmed."""
+    visual_feedback.set_state("waking")
 
 
 def handle_input_ready_sync(audio_path: str, vision_path: str) -> None:
@@ -99,8 +103,11 @@ async def main() -> None:
     logger.info("Wake Word: 'Anubis'")
     logger.info("Status: Listening in background...")
 
-    # Start the listening loop
-    io_service.listen_in_background(handle_input_ready_sync)
+    # Start the listening loop with immediate wake-word feedback
+    io_service.listen_in_background(
+        callback=handle_input_ready_sync, 
+        on_wake_word=handle_wake_word_feedback
+    )
 
     while True:
         await asyncio.sleep(1)
