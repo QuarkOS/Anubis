@@ -21,7 +21,7 @@ class FakeLLM:
         self._response = response
         self.last_messages: list[Message] = []
 
-    async def complete(
+    async def generate_response(
         self,
         messages: list[Message],
         *,
@@ -38,7 +38,7 @@ class FakeLLM:
             model="fake-model",
         )
 
-    async def count_tokens(self, text: str, *, model: str = "default") -> int:
+    async def estimate_token_count(self, text: str, *, model: str = "default") -> int:
         return len(text.split())
 
 

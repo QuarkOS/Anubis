@@ -17,6 +17,7 @@ import structlog
 import torch
 from faster_whisper import WhisperModel
 from kokoro_onnx import Kokoro
+from rapidfuzz import fuzz
 
 logger = structlog.get_logger(__name__)
 
@@ -24,6 +25,7 @@ class AudioVisionService:
     """Orchestrates synchronized screen and audio capture with Wake-Word activation and local TTS."""
     
     def __init__(self, hotkey='f14', use_vad=True, wake_word="anubis"):
+        """Initialize the service and set up local VAD, Whisper, and Kokoro models."""
         self.hotkey = hotkey
         self.use_vad = use_vad
         self.wake_word = wake_word.lower()
@@ -43,7 +45,7 @@ class AudioVisionService:
         # VAD State
         self.vad_model = None
         self.is_speech_active = False
-        self.silence_threshold_ms = 600 # Faster trigger
+        self.silence_threshold_ms = 1000 # Increased for natural pauses in long requests
         self.last_speech_time = 0
         
         # Wake Word & TTS Models
@@ -54,7 +56,9 @@ class AudioVisionService:
             "her now bist", "hey anubis", "hey a knew this", 
             "annubis", "a newbie", "hi anubis", "hey a noticed",
             "hey i know this", "here and do this", "here i know this",
-            "heja nugus", "janugus", "now bist", "hey anubus", "hey a nubus"
+            "heja nugus", "janugus", "now bist", "hey anubus", "hey a nubus",
+            "hainubis", "hanubis", "hey a new bus", "hey an ubis", "hey a nubes",
+            "her nubis", "nubis", "nubus", "ubis", "newbus", "a nubis", "hey a nubis"
         ]
         
         try:
@@ -66,7 +70,7 @@ class AudioVisionService:
             self._init_models()
 
     def _init_models(self):
-        """Initialize VAD, Whisper, and Kokoro TTS."""
+        """Warm up local inference models for speech detection, transcription, and synthesis."""
         try:
             # VAD
             self.vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
@@ -88,14 +92,25 @@ class AudioVisionService:
             self.use_vad = False
 
     def _buffer_audio_stream(self, indata, frames, time_info, status):
-        """Buffer audio and run VAD/Wake-word logic."""
+        """
+        Stream callback for managing the rolling audio buffer and triggering VAD logic.
+        
+        Maintains a 15s-30s buffer that intelligently preserves context during active speech.
+        """
         audio_data = indata.copy()
         self.audio_chunks.append(audio_data)
         
-        # Keep only last 5 seconds of audio in the buffer to prevent memory growth
-        # and ensure we aren't checking ancient audio for wake words.
-        max_chunks = int(5 * self.sample_rate / 512) 
-        if len(self.audio_chunks) > max_chunks:
+        # Buffer capacity logic:
+        # 1. We keep a rolling 15s window by default.
+        # 2. If speech is active, we NEVER truncate the buffer, allowing long commands to be captured fully.
+        # 3. We implement a 30s 'safety cap' to prevent unbounded memory growth in noisy environments.
+        
+        rolling_window_chunks = int(15 * self.sample_rate / 512)
+        hard_limit_chunks = int(30 * self.sample_rate / 512)
+        
+        if len(self.audio_chunks) > hard_limit_chunks:
+            self.audio_chunks.pop(0)
+        elif len(self.audio_chunks) > rolling_window_chunks and not self.is_speech_active:
             self.audio_chunks.pop(0)
 
         if self.use_vad and self.vad_model:
@@ -116,7 +131,12 @@ class AudioVisionService:
                         threading.Thread(target=self._process_voice_trigger, daemon=True).start()
 
     def _process_voice_trigger(self):
-        """Check if the recorded audio contains the wake word."""
+        """
+        Transcribe the current buffer and evaluate wake-word activation.
+        
+        Uses a combination of exact phonetic matches and fuzzy similarity scores
+        to ensure robust activation even with variable Whisper output.
+        """
         if not self.audio_chunks:
             return
 
@@ -124,13 +144,16 @@ class AudioVisionService:
         current_audio = self.audio_chunks[:]
         audio_full = np.concatenate(current_audio, axis=0).flatten()
         
-        # Noise gate
-        if np.max(np.abs(audio_full)) < 0.015:
+        # Audio Normalization: ensures consistent signal for Whisper
+        max_vol = np.max(np.abs(audio_full))
+        if max_vol < 0.01:
             return
-
+        audio_full = audio_full / max_vol * 0.9
+        
+        # Higher beam_size (5) for better phonetic accuracy
         segments, _ = self.whisper_model.transcribe(
             audio_full, 
-            beam_size=1, 
+            beam_size=5, 
             initial_prompt="Anubis, Hey Anubis."
         )
         
@@ -146,7 +169,19 @@ class AudioVisionService:
 
         logger.info("transcribed_locally", text=transcript)
 
-        if any(word in transcript for word in self.wake_word_alternatives):
+        # 1. Exact/Substring match (Fast)
+        matched = any(word in transcript for word in self.wake_word_alternatives)
+
+        # 2. Fuzzy match (Robust)
+        # We check the first 20 characters for a fuzzy match against 'hey anubis'
+        if not matched and len(transcript) > 3:
+            start_snippet = transcript[:20]
+            score = fuzz.partial_ratio("hey anubis", start_snippet)
+            if score > 80: # High confidence fuzzy match
+                logger.info("fuzzy_wake_word_detected", score=score, snippet=start_snippet)
+                matched = True
+
+        if matched:
             logger.info("wake_word_detected", matched_transcript=transcript)
             self._capture_vision()
             
@@ -160,7 +195,7 @@ class AudioVisionService:
                 self.on_input_ready(self.audio_buffer_path, self.vision_buffer_path)
 
     def _capture_vision(self):
-        """Capture all monitors."""
+        """Capture a composite image of all connected monitors using mss."""
         try:
             sct_img = self.mss.grab(self.mss.monitors[0])
             img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
@@ -170,7 +205,7 @@ class AudioVisionService:
             logger.error("vision_capture_failed", error=str(exc))
 
     def start_multimodal_capture(self):
-        """Start the background listening stream."""
+        """Initialize the background audio stream and begin VAD monitoring."""
         if not self.recording:
             logger.info("anubis_listening_background", mode="wake_word")
             self.recording = True
@@ -189,52 +224,86 @@ class AudioVisionService:
                 self.recording = False
 
     def listen_in_background(self, callback) -> None:
-        """Entry point for always-on mode."""
+        """Entry point for the always-on multimodal listening loop."""
         self.on_input_ready = callback
         self.start_multimodal_capture()
 
     async def speak(self, text: str):
-        """Convert text to speech using Kokoro (Streaming Sentences) and play back."""
+        """
+        Synthesize and play audio for the given text using Kokoro TTS.
+        
+        Employs a gapless sentence-by-sentence streaming producer-consumer loop
+        to minimize playback latency while synthesis is in progress.
+        """
+        if not pygame.mixer.get_init():
+            logger.warning("pygame_mixer_not_initialized_skipping_tts", text=text)
+            return
+
         if self.stream:
             self.stream.stop()
             
         # Clean text
         clean_text = re.sub(r'[*`#]', '', text).strip()
         
-        # Split into sentences for pseudo-streaming (minimizes time-to-first-audio)
-        # We split by common sentence enders followed by space or end of string
-        sentences = re.split(r'(?<=[.!?]) +', clean_text)
+        # Split into sentences
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', clean_text) if s.strip()]
+        if not sentences:
+            return
+
+        logger.info("generating_kokoro_tts_gapless", voice="bf_isabella", sentence_count=len(sentences))
         
-        logger.info("generating_kokoro_tts_stream", voice="bf_isabella", sentence_count=len(sentences))
+        # We use a Queue to pass generated audio samples to the playback loop
+        audio_queue = asyncio.Queue()
         
+        async def producer():
+            """Generates audio samples in the background."""
+            try:
+                for sentence in sentences:
+                    # Generate samples in a thread to not block the event loop
+                    samples, sample_rate = await asyncio.to_thread(
+                        self.kokoro.create,
+                        sentence,
+                        voice="bf_isabella",
+                        speed=1.0,
+                        lang="en-gb"
+                    )
+                    await audio_queue.put((samples, sample_rate))
+                # Signal end of generation
+                await audio_queue.put(None)
+            except Exception as e:
+                logger.error("tts_producer_failed", error=str(e))
+                await audio_queue.put(None)
+
+        # Start the background producer
+        producer_task = asyncio.create_task(producer())
+
         try:
-            for i, sentence in enumerate(sentences):
-                if not sentence.strip():
-                    continue
+            seg_idx = 0
+            while True:
+                # Get next generated audio set
+                item = await audio_queue.get()
+                if item is None:
+                    break
                     
-                # Use 'bf_isabella' (Isabelle British Female)
-                samples, sample_rate = self.kokoro.create(
-                    sentence, 
-                    voice="bf_isabella", 
-                    speed=1.0, 
-                    lang="en-gb"
-                )
-                
-                audio_file = f"anubis_response_seg_{i % 2}.wav" # Alternate files for safety
+                samples, sample_rate = item
+                audio_file = f"anubis_response_seg_{seg_idx % 2}.wav"
                 sf.write(audio_file, samples, sample_rate)
                 
                 pygame.mixer.music.load(audio_file)
                 pygame.mixer.music.play()
                 
-                # Wait for the current sentence to finish before starting next generation/playback
-                # (Actual background streaming could be done with a queue, but this is a massive improvement)
+                # While this segment is playing, the producer is already working 
+                # on the next item and putting it into the queue.
                 while pygame.mixer.music.get_busy():
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01) # High frequency polling for minimal gap
+                
+                seg_idx += 1
                 
             pygame.mixer.music.unload()
         except Exception as e:
             logger.error("kokoro_tts_failed", error=str(e))
         finally:
+            await producer_task
             if self.stream:
                 self.stream.start()
                 self.audio_chunks = []

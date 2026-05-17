@@ -17,6 +17,7 @@ class LLMGeminiProvider(LLMProvider):
     """Adapter for Google Gemini API providing multimodal generation capabilities."""
 
     def __init__(self, api_key: str):
+        """Initialize the Gemini client using the provided API key."""
         if not api_key:
             logger.warning("gemini_provider_init", message="No API key provided.")
         self.client = genai.Client(api_key=api_key)
@@ -30,7 +31,12 @@ class LLMGeminiProvider(LLMProvider):
         max_tokens: int = 4096,
         response_format: type | None = None,
     ) -> CompletionResult:
-        """Execute a generation turn, automatically uploading local files referenced in the latest message."""
+        """
+        Execute a multimodal generation turn, automatically uploading local file references.
+        
+        Parses the latest user message for <file:path> tags, uploads identified 
+        media to the Gemini File API, and injects them as active context parts.
+        """
         
         gemini_contents = []
         for i, msg in enumerate(messages):
@@ -44,7 +50,7 @@ class LLMGeminiProvider(LLMProvider):
             
             if is_latest_message:
                 for file_path in file_matches:
-                    if os.path.exists(file_path):
+                    if os.path.isfile(file_path):
                         logger.info("gemini_uploading_file", file=file_path)
                         uploaded_file = self.client.files.upload(file=file_path)
                         file_part = types.Part(
@@ -55,7 +61,7 @@ class LLMGeminiProvider(LLMProvider):
                         )
                         parts.append(file_part)
                     else:
-                        logger.warning("gemini_file_missing", file=file_path)
+                        logger.warning("gemini_file_missing_or_not_file", file=file_path)
             
             cleaned_text = FILE_TAG_PATTERN.sub("", text_content).strip()
             if cleaned_text:
@@ -106,13 +112,19 @@ class LLMGeminiProvider(LLMProvider):
         
         logger.info("gemini_response", finish_reason=finish_reason, text_length=len(full_text))
 
+        prompt_tokens = 0
+        completion_tokens = 0
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            completion_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+
         return CompletionResult(
             content=full_text,
             model=model,
-            prompt_tokens=0,
-            completion_tokens=0,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
 
     async def estimate_token_count(self, text: str, *, model: str = "gemini-3-flash-preview") -> int:
-        """Provide a heuristic estimation of the token count for a given text string."""
+        """Provide a simple character-based heuristic for token estimation."""
         return len(text) // 4

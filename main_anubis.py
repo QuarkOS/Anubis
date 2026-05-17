@@ -13,6 +13,7 @@ from anubis.prompts import PromptRegistry
 from anubis.domain.schemas import ChatRequest
 from anubis.repositories.conversation_memory import InMemoryConversationRepository
 from anubis.repositories.llm_gemini import LLMGeminiProvider
+from anubis.repositories.system_windows import WindowsSystemProbe
 from anubis.services.agent import AgentService
 from anubis.services.context import SlidingWindowContextBuilder
 from anubis.services.io_service import AudioVisionService
@@ -27,24 +28,15 @@ if not settings.llm_api_key:
 llm_provider = LLMGeminiProvider(api_key=settings.llm_api_key)
 repo = InMemoryConversationRepository()
 context_builder = SlidingWindowContextBuilder(llm=llm_provider)
+system_probe = WindowsSystemProbe()
 prompts = PromptRegistry()
-
-prompts._templates["system.default"] = (
-    "You are Anubis, a highly intelligent voice-first desktop assistant. "
-    "You communicate via speech. By default, your answers MUST BE extremely concise: never exceed 1-2 short sentences. "
-    "ONLY provide a detailed explanation IF the user explicitly asks you to 'explain' or 'elaborate'. "
-    "NEVER use markdown, bullet points, or complex formatting. Just give the direct answer. "
-    "The user is sending you audio recordings of their voice and a screenshot of their current screen. "
-    "Use the screenshot to answer questions about what they are doing or looking at. "
-    "IMPORTANT LANGUAGE RULE: Always respond in the detected language of the user. "
-    "However, if the user is speaking a regional dialect (e.g., Austrian German), you must reply in the standard base language (e.g., standard High German)."
-)
 
 agent_service = AgentService(
     llm=llm_provider,
     repo=repo,
     context_builder=context_builder,
-    prompts=prompts
+    prompts=prompts,
+    system_probe=system_probe
 )
 io_service = AudioVisionService(hotkey='f14')
 
@@ -52,7 +44,12 @@ current_conversation_id = None
 
 
 async def process_captured_media(audio_path: str, vision_path: str) -> None:
-    """Handle audio and vision input captured by the I/O layer and generate a response."""
+    """
+    Handle multimodal input from the I/O layer and generate an assistant response.
+    
+    This function acts as the primary pipeline, uploading media to Gemini, 
+    managing conversation state, and triggering the local TTS engine.
+    """
     global current_conversation_id
     logger.info("input_ready", audio=audio_path, vision=vision_path)
     
@@ -80,12 +77,12 @@ async def process_captured_media(audio_path: str, vision_path: str) -> None:
 
 
 def handle_input_ready_sync(audio_path: str, vision_path: str) -> None:
-    """Bridge synchronous I/O callbacks to the async processing pipeline."""
+    """Synchronous bridge callback required by the background listening thread."""
     asyncio.run(process_captured_media(audio_path, vision_path))
 
 
 async def main() -> None:
-    """Initialize the assistant and start background input listeners."""
+    """Initialize the service container and start the background multimodal listeners."""
     logger.info("=======================================")
     logger.info("🌟 ANUBIS MULTIMODAL ASSISTANT ONLINE")
     logger.info("=======================================")

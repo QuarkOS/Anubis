@@ -21,7 +21,7 @@ from pydantic import ValidationError
 
 from anubis.domain.exceptions import LLMJsonParseError, LLMRateLimitError
 from anubis.domain.models import CompletionResult, Conversation, Message, Role
-from anubis.domain.protocols import ContextBuilder, ConversationRepository, LLMProvider
+from anubis.domain.protocols import ContextBuilder, ConversationRepository, LLMProvider, SystemProbe
 from anubis.domain.schemas import (
     ChatRequest,
     ChatResponse,
@@ -36,7 +36,7 @@ _MAX_CONTEXT_TOKENS = 120_000
 
 
 class AgentService:
-    """Orchestrates LLM interactions, memory management, and context building."""
+    """Orchestrates LLM interactions, memory management, and situational context building."""
 
     def __init__(
         self,
@@ -45,23 +45,36 @@ class AgentService:
         repo: ConversationRepository,
         context_builder: ContextBuilder,
         prompts: PromptRegistry,
+        system_probe: SystemProbe | None = None,
     ) -> None:
+        """Initialize the service with its primary domain dependencies."""
         self._llm = llm
         self._repo = repo
         self._ctx = context_builder
         self._prompts = prompts
+        self._system = system_probe
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
-        """Process a chat turn by building context, calling the LLM, and persisting the interaction."""
+        """
+        Execute a complete chat turn, including situational telemetry and history management.
+        
+        Captures the current system state, renders the system prompt, assembles 
+        the context window, and executes the LLM completion.
+        """
         log = logger.bind(conversation_id=str(request.conversation_id))
         conversation = await self._load_or_create_conversation(request.conversation_id)
 
         user_msg = Message(role=Role.USER, content=request.message)
         conversation.messages.append(user_msg)
 
+        system_state = None
+        if self._system:
+            system_state = await self._system.probe_state()
+
         system_prompt = self._prompts.render_prompt(
             "system.default",
             current_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            system_state=system_state,
         )
         context = await self._ctx.build_message_context(
             conversation,
@@ -101,7 +114,11 @@ class AgentService:
     async def extract_structured(
         self, text: str, *, model: str = "default"
     ) -> StructuredExtractionResult:
-        """Extract structured entities from text with automatic retry on JSON parsing failures."""
+        """
+        Extract typed entities from raw text using a structured JSON schema.
+        
+        Includes automatic retry logic to handle common LLM JSON formatting hallucinations.
+        """
         system_prompt = self._prompts.render_prompt("system.extraction")
         messages = [
             Message(role=Role.SYSTEM, content=system_prompt),
@@ -137,13 +154,15 @@ class AgentService:
         raise last_error  # type: ignore[misc]
 
     async def _load_or_create_conversation(self, conversation_id: str | None) -> Conversation:
-        """Retrieve a conversation by ID or initialize a new one."""
+        """Retrieve a conversation by ID or initialize a new one if missing or invalid."""
         if conversation_id:
             from uuid import UUID
-
-            existing = await self._repo.fetch_conversation(UUID(str(conversation_id)))
-            if existing:
-                return existing
+            try:
+                existing = await self._repo.fetch_conversation(UUID(str(conversation_id)))
+                if existing:
+                    return existing
+            except ValueError:
+                logger.warning("invalid_conversation_uuid", conversation_id=conversation_id)
         return Conversation(id=uuid4())
 
     async def _request_completion_with_retry(
@@ -154,7 +173,7 @@ class AgentService:
         temperature: float = 0.7,
         max_tokens: int = 4096,
     ) -> CompletionResult:
-        """Call the LLM and retry on rate limits using exponential backoff."""
+        """Execute an LLM request with exponential backoff on rate limit errors."""
         import asyncio
 
         max_attempts = 3
@@ -178,7 +197,11 @@ class AgentService:
 
     @staticmethod
     def _parse_llm_json_output(raw: str, schema: type[StructuredExtractionResult]) -> StructuredExtractionResult:
-        """Parse and validate JSON from raw LLM output, handling common formatting hallucinations."""
+        """
+        Clean and validate raw LLM output against a Pydantic schema.
+        
+        Surgically extracts JSON objects from markdown fences and handles common truncation errors.
+        """
         cleaned = raw
         if "```" in cleaned:
             lines = cleaned.split("\n")

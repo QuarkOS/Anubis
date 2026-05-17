@@ -53,3 +53,55 @@ class StructuredExtractionResult(BaseModel):
 
     entities: list[ExtractedEntity] = Field(default_factory=list)
     summary: str = ""
+
+
+class ProcessInfo(BaseModel):
+    """Resource usage information for a single process, including CPU and memory footprint."""
+
+    name: str
+    cpu_percent: float
+    memory_mb: float
+    pid: int
+
+
+class GPUInfo(BaseModel):
+    """Information about a GPU device, tracking load, memory, and thermal state."""
+
+    name: str
+    load_percent: float
+    memory_used_mb: float
+    memory_total_mb: float
+    temperature: float
+
+
+class NetworkState(BaseModel):
+    """Real-time network throughput and connection metadata."""
+
+    ssid: str | None = None
+    upload_kbps: float
+    download_kbps: float
+    public_ip: str | None = None
+    location: str | None = None
+
+
+class UserContext(BaseModel):
+    """Ambient cues about the user's activity, such as clipboard and recent files."""
+
+    clipboard_preview: str | None = None
+    recent_files: list[str] = Field(default_factory=list)
+    media_info: str | None = None
+
+
+class SystemState(BaseModel):
+    """A comprehensive snapshot of system resources, network state, and user context."""
+
+    cpu_percent: float
+    memory_percent: float
+    battery_percent: float | None = None
+    active_window: str | None = None
+    top_processes: list[ProcessInfo] = Field(default_factory=list)
+    gpus: list[GPUInfo] = Field(default_factory=list)
+    network: NetworkState | None = None
+    user_context: UserContext | None = None
+    os_name: str
+    timestamp: str
